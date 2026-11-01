@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // AppleKeyStore for an ephemeral offline fixture: a notification service (the public IOKit matching class used by
-// MKBEventsRegister) and, only when sheng-aks=1 is set, a user client that answers the state queries of the unchanged
+// MKBEventsRegister) and, only when sheng-aks is set, a user client that answers the state queries of the unchanged
 // libaks/MobileKeyBag truthfully for this environment: no keybag, no passcode, nothing locked. It provides no key,
 // keybag, passcode or data-protection operation; every other selector fails with kIOReturnError exactly as an unreachable
 // AppleKeyStore does. It protects nothing and must not be taken for secure storage.
@@ -8,24 +8,28 @@
 // Answers (selectors and layouts read from the unchanged target's libaks/MobileKeyBag, see docs/touch-nt36532e.md; the set that is
 // enough for the system daemons on iOS 16.7 was established on hardware by github.com/dipa-studio/ios-sweet, whose notes document it):
 //   0, 4, 5, 9, 12, 13, 26, 27, 55, 101, 102   succeed, no outputs (open handshake, bag/assertion/notify bookkeeping)
-//   14       aks_get_system                        scalar out: system keybag handle 0 (keybagd then needs no systembag.kb)
+//   14       aks_get_system                        scalar out: handle 0; sheng-aks=2 fails as an unreachable keystore
+//                                                 (kIOReturnError), sheng-aks=3 as "no system keybag" (kIOReturnNotFound)
 //   7        aks_get_lock_state(device)            scalar out: bit 2 = unlocked since boot
 //   17, 35   aks_get_(extended_)device_state       struct out: DER SET{ SEQUENCE{ UTF8String key, INTEGER value } ... }
-//            keys ss sls sb sfa sgs sas sgpe srcd sms bh; ss = 4, sls = lock state (0 unlocked; 3 would be "no passcode").
+//            keys ss sls sb sfa sgs sas sgpe srcd sms bh; ss = state flags (4, sheng-aks-ss), sls = lock state
+//            (sheng-aks-sls; 0 unlocked, 3 "no passcode").
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 extern "C" void native_keyevents_open_refused(void);
 extern "C" bool native_aks_state_enabled(void);
 extern "C" uint32_t native_aks_lock_state(void);
+extern "C" uint32_t native_aks_system_mode(void);
+extern "C" uint32_t native_aks_state_flags(void);
 extern "C" void native_aks_call(uint32_t selector, int32_t result);
 extern "C" void native_aks_opened(void);
 
 namespace {
 constexpr uint32_t kSelLockState = 7, kSelGetSystem = 14, kSelDeviceState = 17, kSelExtendedDeviceState = 35;
 constexpr uint64_t kUnlockedSinceBoot = 4;
-constexpr uint32_t kStateFlags = 4;
 constexpr uint64_t kSystemHandle = 0;
 constexpr IOReturn kAksError = (IOReturn)0xe00002bc;   // what libaks reports itself when the connection is missing
+constexpr IOReturn kAksNotFound = (IOReturn)0xe00002f0;   // keybagd reads this as "no system keybag"
 constexpr IOReturn kAksUnsupported = (IOReturn)0xe00002c7;
 
 struct DerWriter {
@@ -54,7 +58,7 @@ size_t entrySize(const char *key, uint64_t value) {
 // DER SET of SEQUENCE{UTF8String, INTEGER}. Returns the length, or 0 when the buffer is too small.
 extern "C" size_t native_aks_encode_state(uint8_t *out, size_t capacity, uint32_t lockState) {
     struct Entry { const char *key; uint64_t value; };
-    const Entry entries[] = {{"ss", kStateFlags}, {"sls", lockState}, {"sb", 0}, {"sfa", 0}, {"sgs", 0},
+    const Entry entries[] = {{"ss", native_aks_state_flags()}, {"sls", lockState}, {"sb", 0}, {"sfa", 0}, {"sgs", 0},
                              {"sas", 0}, {"sgpe", 0}, {"srcd", 0}, {"sms", 0}, {"bh", 0}};
     size_t total = 0;
     for (const Entry &e : entries) total += entrySize(e.key, e.value);
@@ -86,6 +90,8 @@ public:
             rc = kIOReturnSuccess;
             break;
         case kSelGetSystem:
+            if (native_aks_system_mode() == 2) { args->scalarOutputCount = 0; rc = kAksError; break; }
+            if (native_aks_system_mode() == 3) { args->scalarOutputCount = 0; rc = kAksNotFound; break; }
             if (args->scalarOutputCount < 1 || !args->scalarOutput) { rc = kIOReturnBadArgument; break; }
             args->scalarOutput[0] = kSystemHandle;
             args->scalarOutputCount = 1;
